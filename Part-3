@@ -1,0 +1,175 @@
+from flask import Blueprint, jsonify
+from sqlalchemy import func
+from math import ceil
+from datetime import datetime, timedelta
+
+from app import db
+from models import (
+    Company, Warehouse, Product, Inventory,
+    SalesOrder, SalesOrderItem, Supplier, SupplierProducts, LowStockThreshold
+)
+
+alerts_bp = Blueprint('alerts', __name__)
+
+# Configuration: can be adjusted by product/ops team
+RECENT_DAYS = 30                 # Lookback window for “recent sales”
+DEFAULT_THRESHOLD = 10           # Default low-stock threshold if none specified
+
+@alerts_bp.route('/api/companies/<int:company_id>/alerts/low-stock', methods=['GET'])
+def low_stock_alerts(company_id):
+    """
+    Computes low-stock alerts for all products belonging to a company.
+    Logic:
+      - Only include products that had sales in the past RECENT_DAYS.
+      - Combine inventory data with product info and thresholds.
+      - Compare current stock with the appropriate threshold.
+      - Estimate stockout time based on average daily sales.
+      - Attach supplier information to help with reordering.
+    """
+
+    # Step 1: Check that the company exists to avoid invalid requests
+    company = db.session.get(Company, company_id)
+    if not company:
+        return jsonify({"error": "Company not found"}), 404
+
+    # Step 2: Determine the date range for "recent sales"
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=RECENT_DAYS)
+
+    # Step 3: Aggregate total quantity sold per product within the recent window
+    recent_sales_rows = (
+        db.session.query(
+            SalesOrderItem.product_id,
+            func.sum(SalesOrderItem.quantity).label('qty_sold')
+        )
+        .join(SalesOrder, SalesOrder.id == SalesOrderItem.order_id)
+        .filter(
+            SalesOrder.company_id == company_id,
+            SalesOrder.created_at >= start_date,
+            SalesOrder.created_at <= end_date,
+            SalesOrder.status.in_(('placed', 'shipped', 'completed'))
+        )
+        .group_by(SalesOrderItem.product_id)
+        .all()
+    )
+
+    # Convert sales rows into a usable lookup structure
+    sales_map = {row.product_id: float(row.qty_sold) for row in recent_sales_rows}
+
+    # If there were no recent sales, there cannot be any low-stock alerts
+    if not sales_map:
+        return jsonify({"alerts": [], "total_alerts": 0})
+
+    product_ids = list(sales_map.keys())
+
+    # Step 4: Fetch inventory for all warehouses containing these products
+    # Includes product & warehouse names for response readability
+    inventories = (
+        db.session.query(
+            Inventory.product_id,
+            Inventory.warehouse_id,
+            Inventory.quantity,
+            Product.name.label('product_name'),
+            Product.sku.label('sku'),
+            Product.product_type.label('product_type'),
+            Warehouse.name.label('warehouse_name')
+        )
+        .join(Product, Product.id == Inventory.product_id)
+        .join(Warehouse, Warehouse.id == Inventory.warehouse_id)
+        .filter(
+            Product.company_id == company_id,
+            Inventory.product_id.in_(product_ids)
+        )
+        .all()
+    )
+
+    alerts = []
+
+    # Step 5: Evaluate each (product, warehouse) pair for low-stock
+    for inv in inventories:
+        pid = inv.product_id
+        wid = inv.warehouse_id
+        current_stock = int(inv.quantity or 0)
+
+        # Compute average daily sales from total recent sales
+        qty_sold = sales_map.get(pid, 0.0)
+        avg_daily_sales = qty_sold / RECENT_DAYS
+
+        # Zero or negative average daily sales indicates no meaningful activity
+        if avg_daily_sales <= 0:
+            continue
+
+        # Step 6: Determine the applicable threshold
+        # Priority:
+        #   1. Product-specific threshold
+        #   2. Product-type threshold
+        #   3. Default system threshold
+        threshold_row = (
+            db.session.query(LowStockThreshold)
+            .filter(
+                LowStockThreshold.company_id == company_id,
+                LowStockThreshold.product_id == pid
+            )
+            .first()
+        )
+
+        if threshold_row:
+            threshold = int(threshold_row.threshold)
+        else:
+            if inv.product_type:
+                type_row = (
+                    db.session.query(LowStockThreshold)
+                    .filter(
+                        LowStockThreshold.company_id == company_id,
+                        LowStockThreshold.product_type == inv.product_type
+                    )
+                    .first()
+                )
+                threshold = int(type_row.threshold) if type_row else DEFAULT_THRESHOLD
+            else:
+                threshold = DEFAULT_THRESHOLD
+
+        # Skip if stock level is adequate
+        if current_stock >= threshold:
+            continue
+
+        # Step 7: Choose the supplier with the shortest lead time
+        supplier_entry = (
+            db.session.query(Supplier, SupplierProducts)
+            .join(SupplierProducts, SupplierProducts.supplier_id == Supplier.id)
+            .filter(SupplierProducts.product_id == pid)
+            .order_by(func.coalesce(SupplierProducts.lead_time_days, 999999).asc())
+            .first()
+        )
+
+        supplier_info = None
+        if supplier_entry:
+            supplier = supplier_entry[0]
+            supplier_info = {
+                "id": supplier.id,
+                "name": supplier.name,
+                "contact_email": supplier.contact_email
+            }
+
+        # Step 8: Estimate when product will run out of stock
+        try:
+            days_until_stockout = ceil(current_stock / avg_daily_sales)
+        except Exception:
+            days_until_stockout = None
+
+        # Step 9: Construct an alert entry for this item
+        alert = {
+            "product_id": pid,
+            "product_name": inv.product_name,
+            "sku": inv.sku,
+            "warehouse_id": wid,
+            "warehouse_name": inv.warehouse_name,
+            "current_stock": current_stock,
+            "threshold": threshold,
+            "days_until_stockout": days_until_stockout,
+            "supplier": supplier_info
+        }
+        alerts.append(alert)
+
+    # Step 10: Return summary result
+    return jsonify({"alerts": alerts, "total_alerts": len(alerts)})
