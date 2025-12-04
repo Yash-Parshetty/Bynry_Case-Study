@@ -1,0 +1,60 @@
+@app.route('/api/products', methods=['POST'])
+def create_product():
+    data = request.json or {}
+
+    name = data.get('name')
+    sku = data.get('sku')
+    price_raw = data.get('price')
+    initial_quantity = data.get('initial_quantity', 0)
+    company_id = data.get('company_id')
+
+    if not name or not sku:
+        return {"error": "name and sku are required"}
+
+    try:
+        price = Decimal(str(price_raw)) if price_raw is not None else None
+        if price is not None and price < 0:
+            return {"error": "price must be non-negative"}, 
+    except (InvalidOperation, TypeError):
+        return {"error": "invalid price format"}, 
+
+    try:
+        with db.session.begin():
+            existing = Product.query.filter_by(sku=sku, company_id=company_id).first()
+            if existing:
+                return {"error": "SKU already exists", "product_id": existing.id},
+
+            product = Product(
+                name=name,
+                sku=sku,
+                company_id=company_id,
+                price=price
+            )
+            db.session.add(product)
+            db.session.flush()
+
+            if warehouse_id is not None:
+                inv_q = Inventory.query.filter_by(product_id=product.id, warehouse_id=warehouse_id)
+                try:
+                    inv = inv_q.with_for_update().first()
+                except Exception:
+                   inv = inv_q.first()
+
+                if inv:
+                    inv.quantity = initial_quantity
+                else:
+                    inv = Inventory(
+                        product_id=product.id,
+                        warehouse_id=warehouse_id,
+                        quantity=initial_quantity
+                    )
+                    db.session.add(inv)
+
+    except IntegrityError as e:
+        db.session.rollback()
+        return {"error": "database integrity error", "detail": str(e)},
+    except Exception as e:
+        db.session.rollback()
+        return {"error": "server error", "detail": str(e)},
+
+return {"message": "Product created", "product_id": product.id}, 
